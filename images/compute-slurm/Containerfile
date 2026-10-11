@@ -1,0 +1,20 @@
+# Compute image: compute-base with the Slurm client layered on.
+# Stub. The Slurm task fills in the package set and configuration.
+#
+# A layer rather than a second full image, so the common parts are built
+# once and the measured image-build phase stays honest about what is
+# actually being rebuilt.
+ARG IMAGE_BASE=cluster-lab/compute-base:latest
+FROM ${IMAGE_BASE}
+
+LABEL org.opencontainers.image.title="cluster-lab compute-slurm"
+LABEL org.opencontainers.image.description="Compute node image with the Slurm client"
+LABEL org.opencontainers.image.source="https://github.com/dchau360/cluster-images-wip"
+
+# Owned by the Slurm task:
+#   RUN dnf -y install slurm slurm-slurmd munge && dnf clean all
+#
+# The Munge key is NOT installed here. It is generated once per cluster on
+# the lab host and delivered to each node by a Warewulf runtime overlay at
+# boot. An image is world-readable the moment it is served; a shared secret
+# in one is a shared secret in all of them.

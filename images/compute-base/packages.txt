@@ -1,0 +1,19 @@
+# Package set for the common node image, one per line.
+# Kept as data rather than a RUN line so a diff is readable.
+#
+# Stub: the image task fills this in. The entries below are the floor a
+# Warewulf-provisioned node needs to boot and be managed.
+
+# boot and init
+kernel
+dracut
+systemd
+
+# network
+NetworkManager
+iproute
+
+# management
+openssh-server
+chrony
+rsync

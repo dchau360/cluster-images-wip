@@ -1,0 +1,23 @@
+# Common node image. Everything every compute node needs and nothing it
+# does not. Stub: the image task fills in the package set.
+#
+# Pinned base on purpose. An unpinned base makes the 1-to-N curve
+# unreproducible, because two runs a week apart would not be measuring the
+# same thing.
+ARG IMAGE_BASE=docker.io/rockylinux/rockylinux:9
+FROM ${IMAGE_BASE}
+
+LABEL org.opencontainers.image.title="cluster-lab compute-base"
+LABEL org.opencontainers.image.description="Common HPC node image for the cluster lab"
+LABEL org.opencontainers.image.source="https://github.com/dchau360/cluster-images-wip"
+
+# The package set lives in a file, not in a RUN line, so a diff of what the
+# image contains is readable.
+COPY packages.txt /tmp/packages.txt
+
+# Owned by the image task. Left as a declared gap rather than a guess:
+#   RUN dnf -y install $(grep -v '^#' /tmp/packages.txt | tr '\n' ' ') \
+#    && dnf clean all && rm -rf /var/cache/dnf
+
+# No secret is ever baked in. SSH host keys, the Munge key and TLS material
+# arrive from a Warewulf per-node overlay at boot.

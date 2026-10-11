@@ -1,0 +1,150 @@
+---
+# CI for a PUBLIC repository.
+#
+# The first bad commit is the expensive one, so these gates were turned on
+# before any image content existed. The two that stop a leak are `secrets`
+# and `host-values`. The rest keep the skeleton honest.
+#
+# GitHub secret-scanning push protection is enabled on the repository as
+# well, so a credential is refused at `git push` and never reaches a run.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: a key removed from the tip is still a leak.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # First, because it needs no tool: a tracked file named or placed like
+      # key material is a finding even when it is empty, and an empty file
+      # passes every content scan.
+      - name: No secret material is tracked
+        run: ./scripts/check-no-tracked-secrets.sh
+
+      - name: Install gitleaks ${{ env.GITLEAKS_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan the working tree
+        run: gitleaks dir . --redact --no-banner --verbose --exit-code 1
+
+      - name: Scan the full git history
+        run: gitleaks git . --redact --no-banner --verbose --exit-code 1
+
+  host-values:
+    name: host-value hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The exact-match check needs the real lab/local.env. It is supplied
+      # as a repository secret so CI can search for its values without them
+      # ever being in a tracked file. Fork pull requests get no secret; the
+      # pattern checks in the script still run and still fail on a leaked
+      # address or a real MAC.
+      - name: Materialise lab/local.env from the repository secret
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          LAB_LOCAL_ENV: ${{ secrets.LAB_LOCAL_ENV }}
+        run: |
+          set -euo pipefail
+          if [ -n "${LAB_LOCAL_ENV:-}" ]; then
+            # Never echoed. The checker prints variable names only.
+            printf '%s' "$LAB_LOCAL_ENV" > lab/local.env
+            echo "lab/local.env written, $(wc -l < lab/local.env) line(s)"
+          else
+            echo "LAB_LOCAL_ENV secret not set; pattern checks only"
+          fi
+
+      - name: No host-specific value in any tracked file
+        run: ./scripts/check-no-host-values.sh
+
+      - name: Confirm no tracked file was modified
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "::error::the workflow modified a tracked file"
+            git status --porcelain --untracked-files=no
+            exit 1
+          fi
+          echo "no tracked file was modified"
+
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: pipx install yamllint
+      - run: yamllint --strict .
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Lint every tracked shell script
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files '*.sh')
+          printf 'checking %d script(s)\n' "${#files[@]}"
+          shellcheck -x -S style -P SCRIPTDIR "${files[@]}"
+
+  containerfiles:
+    name: hadolint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install hadolint
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.14.0/hadolint-Linux-x86_64
+          sudo chmod 0755 /usr/local/bin/hadolint
+          hadolint --version
+      - name: Lint every Containerfile
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files '*Containerfile')
+          if [ "${#files[@]}" -eq 0 ]; then echo "no Containerfile yet"; exit 0; fi
+          printf 'checking %d Containerfile(s)\n' "${#files[@]}"
+          hadolint --failure-threshold error "${files[@]}"
+
+  harness:
+    name: harness smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: make help
+        run: make help
+      - name: Image definitions are discovered, never listed by hand
+        run: make images
+      - name: Every script parses
+        run: |
+          set -euo pipefail
+          git ls-files '*.sh' | while read -r f; do bash -n "$f"; echo "ok $f"; done

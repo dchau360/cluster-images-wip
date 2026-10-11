@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# Host-specific configuration. Never tracked.
+# ---------------------------------------------------------------------------
+lab/local.env
+lab/local.env.*
+!lab/local.env.example
+
+# ---------------------------------------------------------------------------
+# Built image artefacts. Never tracked. These are outputs, and large.
+# ---------------------------------------------------------------------------
+build/
+out/
+cache/
+*.tar
+*.tar.gz
+*.tar.zst
+*.oci
+*.sif
+*.squashfs
+*.img
+*.qcow2
+*.iso
+*.raw
+*.cpio
+*.cpio.gz
+*.cpio.zst
+*.initramfs
+*.initrd
+vmlinuz*
+initramfs*
+initrd*
+*.ko
+*.efi
+
+# Warewulf chroots and container stores
+chroots/
+containers/
+provision/
+
+# TFTP / PXE trees, in case a build ever writes one here
+tftpboot/
+tftproot/
+
+# ---------------------------------------------------------------------------
+# Secrets. These come from Warewulf per-node overlays at boot, never here.
+# ---------------------------------------------------------------------------
+*.key
+*.pem
+*.crt
+*.p12
+*.jks
+id_rsa*
+id_ed25519*
+ssh_host_*
+munge.key
+*.vault
+.vault-pass*
+overlays/runtime/**/*.generated
+
+# ---------------------------------------------------------------------------
+# Ansible, logs, timings, editors
+# ---------------------------------------------------------------------------
+*.retry
+.ansible/
+*.log
+*.pid
+timings/
+*.ndjson
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
