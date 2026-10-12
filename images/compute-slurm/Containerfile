@@ -35,11 +35,13 @@ ARG SLURM_SHA256=9bfd844f746c1268d6e0cb14bda586b548b1c4b12f8c72181397d0cec9ce5d3
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
+# `mariadb-devel` is unconditional in the upstream spec even when slurmdbd is
+# never installed; it comes from CRB, which compute-base enables.
 RUN dnf -y install --setopt=install_weak_deps=False \
       rpm-build gcc make autoconf automake pkgconf-pkg-config \
       perl perl-devel 'perl(ExtUtils::MakeMaker)' python3 \
       readline-devel pam-devel munge-devel dbus-devel kernel-headers \
-      hwloc-devel numactl-devel mariadb-connector-c-devel \
+      hwloc-devel numactl-devel mariadb-devel \
  && dnf -y clean all \
  && rm -rf /var/cache/dnf
 
