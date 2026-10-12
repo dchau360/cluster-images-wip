@@ -167,7 +167,7 @@ def infiniband_facts(root: str = "/sys/class/infiniband") -> list[dict]:
         text = hex_only(text)
         if len(text) != 16:
             return ""
-        guid = ":".join(text[i:i + 4] for i in range(0, 16, 4))
+        guid = ":".join(text[i:i + 4] for i in range(0, len(text), 4))
         return "" if set(text) <= {"0"} else guid
 
     for device in sorted(base.iterdir(), key=lambda p: p.name):
