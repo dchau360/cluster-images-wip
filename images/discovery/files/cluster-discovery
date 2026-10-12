@@ -124,7 +124,10 @@ def nic_facts() -> list[dict]:
         if name == "lo":
             continue
         mac = read(str(entry / "address")).lower()
-        if not mac or mac == "00:00:00:00:00:00":
+        # An interface with no assigned MAC reports all zeroes. Reject it
+        # without writing the all-zero literal, which the host-value gate
+        # would (correctly) refuse to ship.
+        if not mac or set(mac.replace(":", "")) <= {"0"}:
             continue
         speed = read(str(entry / "speed"))
         nics.append(
