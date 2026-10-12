@@ -25,16 +25,29 @@ make lint                                # the same gates CI runs
 
 ## What is here today
 
-The hygiene gates and the structure. No image content yet: in a public repo
-the gates are worth more before there is anything to leak than after.
-
 | Working now | Where |
 | --- | --- |
 | `gitleaks` on the working tree and the full history | `.github/workflows/ci.yml` |
 | Host-value hygiene, shared with the platform repo | `scripts/check-no-host-values.sh` |
 | `yamllint`, `hadolint`, `shellcheck` | `.github/workflows/ci.yml` |
 | `.gitignore` covering every image artefact shape | `.gitignore` |
-| Build harness skeleton with timing hooks | `Makefile`, `scripts/` |
+| Build harness with versioned tags, push and timing hooks | `Makefile`, `scripts/build.sh` |
+| `compute-base`: kernel, `wwinit` initramfs, management, inventory, stress tools | `images/compute-base/` |
+| `compute-slurm`: the Slurm client and Munge, layered on the base | `images/compute-slurm/` |
+| Publish to GHCR as public versioned packages, with run provenance | `.github/workflows/images.yml` |
+
+### The image must boot, not just run
+
+A Warewulf node boots in two stages with the `dracut` method: iPXE loads
+`/boot/initramfs-<kver>.img` first, and that initramfs must contain
+Warewulf's `wwinit` dracut module. The upstream distro image has neither a
+kernel nor the module, so `compute-base` installs the kernel and builds the
+initramfs with `--add wwinit`. Without it the node stops at
+dracut's `Failed to mount /sysroot` — a failure this repository hit and now
+verifies in the build with a `lsinitrd ... | grep wwinit` check.
+
+`imgextract` is *not* used: it is a Warewulf patch to iPXE that the Ubuntu
+`ipxe` package does not ship. The two-stage method needs no patched iPXE.
 
 ## Structure
 

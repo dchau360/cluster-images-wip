@@ -1,23 +1,95 @@
-# Common node image. Everything every compute node needs and nothing it
-# does not. Stub: the image task fills in the package set.
+# Common node image. Everything every compute node needs and nothing it does
+# not.
+#
+# The image is built to boot two ways, and the second one is why it looks
+# heavier than a container image normally would:
+#
+#   1. Warewulf imports it and serves its filesystem over HTTP.
+#   2. Warewulf's two-stage boot fetches /boot/initramfs-<kver>.img first,
+#      and that initramfs must contain Warewulf's `wwinit` dracut module.
+#
+# The upstream `rockylinux/rockylinux:9` image has neither a kernel nor the
+# module, so this Containerfile installs the kernel and builds an initramfs
+# with `wwinit` in it. Skip that and the node boots to a dracut emergency
+# shell with "Failed to mount /sysroot" — a real failure this repo hit.
 #
 # Pinned base on purpose. An unpinned base makes the 1-to-N curve
 # unreproducible, because two runs a week apart would not be measuring the
 # same thing.
 ARG IMAGE_BASE=docker.io/rockylinux/rockylinux:9
+
 FROM ${IMAGE_BASE}
 
 LABEL org.opencontainers.image.title="cluster-lab compute-base"
 LABEL org.opencontainers.image.description="Common HPC node image for the cluster lab"
 LABEL org.opencontainers.image.source="https://github.com/dchau360/cluster-images-wip"
 
-# The package set lives in a file, not in a RUN line, so a diff of what the
-# image contains is readable.
-COPY packages.txt /tmp/packages.txt
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
-# Owned by the image task. Left as a declared gap rather than a guess:
-#   RUN dnf -y install $(grep -v '^#' /tmp/packages.txt | tr '\n' ' ') \
-#    && dnf clean all && rm -rf /var/cache/dnf
+# CRB carries openmpi and the HPC libraries; EPEL carries Slurm, Munge and
+# ansible-core. Which repository a package lands in is not something this
+# image should encode, so both are enabled before packages.txt is read.
+RUN dnf -y install epel-release 'dnf-command(config-manager)' \
+ && dnf -y config-manager --set-enabled crb \
+ && dnf -y clean all \
+ && rm -rf /var/cache/dnf
+
+# The package set lives in a file, not in a RUN line, so a diff of what the
+# image contains is readable without reading shell.
+COPY packages.txt /tmp/packages.txt
+RUN mapfile -t pkgs < <(grep -vE '^[[:space:]]*(#|$)' /tmp/packages.txt) \
+ && dnf -y install --setopt=install_weak_deps=False "${pkgs[@]}" \
+ && dnf -y clean all \
+ && rm -rf /var/cache/dnf /var/log/dnf* /var/log/yum* /tmp/packages.txt
+
+# node_exporter is not packaged in EPEL 9. Pin the upstream release rather
+# than compile it, so the version a node reports is visible in the diff.
+ARG NODE_EXPORTER_VERSION=1.8.2
+ARG NODE_EXPORTER_SHA256=6809dd0b3ec45fd6e992c19071d6b5253aed3ead7bf0686885a51d85c6643c66
+RUN curl -fsSLo /tmp/node_exporter.tgz \
+      "https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz" \
+ && echo "${NODE_EXPORTER_SHA256}  /tmp/node_exporter.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/node_exporter.tgz -C /tmp \
+ && install -m 0755 "/tmp/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64/node_exporter" /usr/local/bin/node_exporter \
+ && install -d -m 0755 /usr/local/share/licenses/node_exporter \
+ && cp "/tmp/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64/LICENSE" \
+       /usr/local/share/licenses/node_exporter/LICENSE \
+ && rm -rf /tmp/node_exporter*
+
+COPY files/node_exporter.service /usr/lib/systemd/system/node_exporter.service
+
+# Warewulf's initramfs module. It is not part of any distribution package, so
+# the pinned upstream release is the source. No patch is applied: the module
+# is used as shipped, and the version is the same one the server runs.
+ARG WAREWULF_VERSION=4.7.1
+ARG WAREWULF_SHA256=2f967add15488bef041ab91520b81fa5cc76d82fe625c198063a94aa1f4c7da9
+RUN curl -fsSLo /tmp/warewulf.tgz \
+      "https://github.com/warewulf/warewulf/releases/download/v${WAREWULF_VERSION}/warewulf-${WAREWULF_VERSION}.tar.gz" \
+ && echo "${WAREWULF_SHA256}  /tmp/warewulf.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/warewulf.tgz -C /tmp \
+ && cp -r "/tmp/warewulf-${WAREWULF_VERSION}/dracut/modules.d/90wwinit" \
+       /usr/lib/dracut/modules.d/ \
+ && install -d -m 0755 /usr/local/share/licenses/warewulf \
+ && install -m 0644 "/tmp/warewulf-${WAREWULF_VERSION}/LICENSE.md" \
+       /usr/local/share/licenses/warewulf/LICENSE.md \
+ && rm -rf /tmp/warewulf*
+
+# Build the initramfs with wwinit included, for the exact kernel installed
+# above. `--no-hostonly` because the build host is not the node, and
+# `--add wwinit` because the module opts out of the default set on purpose.
+RUN kver="$(ls /lib/modules | sort -V | tail -1)" \
+ && test -n "$kver" \
+ && dracut --force --no-hostonly --add wwinit "/boot/initramfs-${kver}.img" "$kver" \
+ && lsinitrd "/boot/initramfs-${kver}.img" > /tmp/initramfs.list \
+ && grep -q wwinit /tmp/initramfs.list
+
+# Services ship DISABLED. Enabling them is owned by the node
+# self-configuration task; an image that enables a service pre-empts that
+# owner and hides a step of the boot chain.
+RUN rm -rf /etc/systemd/system/multi-user.target.wants \
+          /etc/systemd/system/sysinit.target.wants \
+          /etc/systemd/system/getty.target.wants \
+ && mkdir -p /etc/systemd/system/multi-user.target.wants
 
 # No secret is ever baked in. SSH host keys, the Munge key and TLS material
 # arrive from a Warewulf per-node overlay at boot.

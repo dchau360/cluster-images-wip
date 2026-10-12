@@ -1,19 +1,67 @@
 # Package set for the common node image, one per line.
 # Kept as data rather than a RUN line so a diff is readable.
 #
-# Stub: the image task fills this in. The entries below are the floor a
-# Warewulf-provisioned node needs to boot and be managed.
+# `node_exporter` is deliberately absent: EPEL 9 does not package it, so the
+# Containerfile installs the pinned upstream release instead.
 
 # boot and init
 kernel
+kernel-modules
 dracut
+dracut-network
+dracut-config-generic
 systemd
+systemd-udev
 
 # network
 NetworkManager
 iproute
-
-# management
-openssh-server
-chrony
+iputils
+ethtool
+bridge-utils
+# `curl-minimal` already ships in the base image and provides the binary
+# Warewulf's initramfs module needs. Installing the full `curl` package
+# would only fight it.
+jq
 rsync
+chrony
+openssh-server
+openssh-clients
+
+# hardware inventory. dmidecode and pciutils are used by the discovery image;
+# the rest make the node self-describing after it boots.
+dmidecode
+pciutils
+lshw
+usbutils
+smartmontools
+
+# storage
+e2fsprogs
+xfsprogs
+parted
+gdisk
+util-linux
+
+# runtime and management
+python3
+python3-pip
+python3-requests
+ansible-core
+
+# telemetry
+sysstat
+lm_sensors
+htop
+
+# stress and benchmark tools
+stress-ng
+fio
+iperf3
+bc
+
+# parallel libraries and topology
+openmpi
+hwloc
+numactl
+openblas

@@ -1,0 +1,140 @@
+---
+# Build and publish the node images to GHCR.
+#
+# The images are public on purpose. A provisioned node must be able to fetch
+# its image with no credential anywhere on it, and `wwctl image import
+# docker://ghcr.io/...` is the one command that has to work on a bare
+# server. A private package would force a token onto the provisioning host
+# and onto every node, which is the thing this design refuses.
+#
+# Every image tag is derived from the commit, so an image traces to the run
+# that built it and the previous tag stays importable for a rollback.
+
+name: images
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "images/**"
+      - "scripts/**"
+      - "lab/local.env.example"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish (default: sha-<commit>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  publish:
+    name: build and push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute the image tag and registry prefix
+        id: meta
+        run: |
+          set -euo pipefail
+          tag='${{ github.event.inputs.tag }}'
+          if [ -z "$tag" ]; then
+            tag="sha-$(git rev-parse --short=12 HEAD)"
+          fi
+          {
+            echo "tag=$tag"
+            echo "prefix=${REGISTRY}/${GITHUB_REPOSITORY}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push every image
+        env:
+          IMAGE_PUSH: "1"
+          IMAGE_PREFIX: ${{ steps.meta.outputs.prefix }}
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+          IMAGE_BASE: ${{ vars.IMAGE_BASE || 'docker.io/rockylinux/rockylinux:9' }}
+        run: |
+          set -euo pipefail
+          # lab/local.env is untracked. The image repository has its own
+          # copy of it, separate from the platform repository's.
+          mkdir -p lab
+          cat > lab/local.env <<EOF
+          IMAGE_ENGINE=docker
+          IMAGE_PREFIX=${IMAGE_PREFIX}
+          IMAGE_TAG=${IMAGE_TAG}
+          IMAGE_BASE=${IMAGE_BASE}
+          IMAGE_BUILD_DIR=${RUNNER_TEMP}/cluster-lab/images
+          LAB_STATE_DIR=${RUNNER_TEMP}/cluster-lab
+          EOF
+          bash scripts/build.sh
+
+      - name: Make the published packages public
+        # Containers pushed with GITHUB_TOKEN can land private. Public is a
+        # functional requirement here, not a preference, so say so loudly
+        # rather than letting a private package surface as an import that
+        # mysteriously needs a credential.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY##*/}"
+          for image in $(bash -c 'source scripts/lib/common.sh >/dev/null 2>&1; lab_image_names'); do
+            if gh api --method PATCH \
+                 "/user/packages/container/${repo}%2F${image}" \
+                 -f visibility=public >/dev/null 2>&1; then
+              echo "ok       ${repo}/${image} is public"
+            else
+              echo "::warning title=package visibility::could not set ${repo}/${image} public with GITHUB_TOKEN; an owner with write:packages must set it once in the package settings"
+            fi
+          done
+
+      - name: Record provenance
+        run: |
+          set -euo pipefail
+          {
+            echo "## Published images"
+            echo
+            echo "| image | tag | digest |"
+            echo "| --- | --- | --- |"
+            for image in compute-base compute-slurm; do
+              ref="${REGISTRY}/${GITHUB_REPOSITORY}/${image}:${{ steps.meta.outputs.tag }}"
+              digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" 2>/dev/null || echo unknown)"
+              echo "| \`${image}\` | \`${{ steps.meta.outputs.tag }}\` | \`${digest}\` |"
+            done
+            echo
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "{"
+            echo "  \"tag\": \"${{ steps.meta.outputs.tag }}\","
+            echo "  \"commit\": \"${GITHUB_SHA}\","
+            echo "  \"run\": \"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\""
+            echo "}"
+          } > provenance.json
+          cat provenance.json
+
+      - name: Upload provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-provenance-${{ steps.meta.outputs.tag }}
+          path: provenance.json
+          if-no-files-found: error

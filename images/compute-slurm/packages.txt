@@ -1,0 +1,5 @@
+# The Slurm client layer. `slurmd` is the daemon a compute node runs;
+# `munge` is the authentication library every Slurm component needs.
+slurm
+slurm-slurmd
+munge

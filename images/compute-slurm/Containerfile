@@ -1,19 +1,39 @@
 # Compute image: compute-base with the Slurm client layered on.
-# Stub. The Slurm task fills in the package set and configuration.
 #
 # A layer rather than a second full image, so the common parts are built
 # once and the measured image-build phase stays honest about what is
 # actually being rebuilt.
-ARG IMAGE_BASE=cluster-lab/compute-base:latest
-FROM ${IMAGE_BASE}
+#
+# The base is the image this repository publishes, not the upstream distro
+# image: `BASE_IMAGE` is passed by scripts/build.sh as
+# <IMAGE_PREFIX>/compute-base:<IMAGE_TAG>, so the layer is built against the
+# same build the registry is about to serve.
+#
+# IMAGE_BASE is accepted so the shared build command can pass it to every
+# image; this layer does not use it.
+ARG IMAGE_BASE=docker.io/rockylinux/rockylinux:9
+ARG BASE_IMAGE=cluster-lab/compute-base:latest
+
+FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="cluster-lab compute-slurm"
 LABEL org.opencontainers.image.description="Compute node image with the Slurm client"
 LABEL org.opencontainers.image.source="https://github.com/dchau360/cluster-images-wip"
 
-# Owned by the Slurm task:
-#   RUN dnf -y install slurm slurm-slurmd munge && dnf clean all
-#
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+COPY packages.txt /tmp/packages.txt
+RUN mapfile -t pkgs < <(grep -vE '^[[:space:]]*(#|$)' /tmp/packages.txt) \
+ && dnf -y install --setopt=install_weak_deps=False "${pkgs[@]}" \
+ && dnf -y clean all \
+ && rm -rf /var/cache/dnf /var/log/dnf* /var/log/yum* /tmp/packages.txt
+
+# Services ship DISABLED. `slurmd` and `munge` have no enablement symlink
+# here on purpose: the node self-configuration task enables them, and it
+# needs the cluster's Munge key first.
+RUN rm -rf /etc/systemd/system/multi-user.target.wants \
+ && mkdir -p /etc/systemd/system/multi-user.target.wants
+
 # The Munge key is NOT installed here. It is generated once per cluster on
 # the lab host and delivered to each node by a Warewulf runtime overlay at
 # boot. An image is world-readable the moment it is served; a shared secret
