@@ -58,7 +58,7 @@ lab_load_env() {
 # chance to create their directories. Both repositories write into one
 # timing stream, so they must agree on who owns it.
 lab_bootstrap_state() {
-  local owner="${LAB_WSL_USER:-$USER}" d
+  local owner="${LAB_WSL_USER:-${USER:-$(id -un)}}" d
   for d in "$LAB_STATE_DIR" "$LAB_RUN_DIR" "$LAB_TIMING_DIR"; do
     [[ -d "$d" ]] || sudo mkdir -p "$d"
   done
