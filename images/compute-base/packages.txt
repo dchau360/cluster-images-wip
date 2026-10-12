@@ -43,11 +43,13 @@ parted
 gdisk
 util-linux
 
-# runtime and management
+# runtime and management. `git` is what `ansible-pull` clones the pinned
+# `deployed` ref with; without it the node cannot configure itself.
 python3
 python3-pip
 python3-requests
 ansible-core
+git-core
 
 # telemetry
 sysstat
