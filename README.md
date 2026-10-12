@@ -34,6 +34,7 @@ make lint                                # the same gates CI runs
 | Build harness with versioned tags, push and timing hooks | `Makefile`, `scripts/build.sh` |
 | `compute-base`: kernel, `wwinit` initramfs, management, inventory, stress tools | `images/compute-base/` |
 | `compute-slurm`: the Slurm client and Munge, layered on the base | `images/compute-slurm/` |
+| `discovery`: live boot that scrapes the machine and registers it in NetBox | `images/discovery/` |
 | Publish to GHCR as public versioned packages, with run provenance | `.github/workflows/images.yml` |
 
 ### The image must boot, not just run
@@ -63,6 +64,11 @@ images/
     README.md
   compute-slurm/              compute image, Slurm client layered on
     Containerfile             stubbed
+    README.md
+  discovery/                  live discovery boot, registers the node in NetBox
+    Containerfile             stubbed
+    files/cluster-discovery   the scrape-and-register payload
+    files/cluster-discovery.service
     README.md
 overlays/
   generic/                    applies to every node, no secrets

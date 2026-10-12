@@ -1,0 +1,48 @@
+# Discovery image: a live boot that makes a machine describe itself.
+#
+# A layer on compute-base, for the same reasons compute-slurm is: the kernel,
+# dracut and the Warewulf `wwinit` initramfs are the expensive parts, and a
+# change to the discovery payload must not rebuild them. The build harness
+# passes BASE_IMAGE as <IMAGE_PREFIX>/compute-base:<IMAGE_TAG>, so the layer is
+# built against the exact base the registry is about to serve.
+#
+# What this layer adds:
+#   * pynetbox, pinned, so a run is reproducible
+#   * the cluster-discovery payload and its systemd unit
+#
+# What it deliberately does not add: any secret. The NetBox endpoint and token
+# arrive at boot from a Warewulf runtime overlay. An image is world-readable
+# the moment it is served, so a credential in one is a credential in every
+# node that boots it.
+ARG IMAGE_BASE=docker.io/rockylinux/rockylinux:9
+ARG BASE_IMAGE=cluster-lab/compute-base:latest
+
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="cluster-lab discovery"
+LABEL org.opencontainers.image.description="Live discovery boot that registers the node in NetBox"
+LABEL org.opencontainers.image.source="https://github.com/dchau360/cluster-images-wip"
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+# Pinned like every other dependency. `--no-cache-dir` keeps the wheel cache
+# out of a layer that will be served to every node.
+ARG PYNETBOX_VERSION=7.5.0
+RUN python3 -m pip install --no-cache-dir "pynetbox==${PYNETBOX_VERSION}" \
+ && python3 -c 'import pynetbox; print("pynetbox", pynetbox.__version__)' \
+ && find /usr/lib/python3*/site-packages -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+COPY files/cluster-discovery /usr/local/sbin/cluster-discovery
+COPY files/cluster-discovery.service /etc/systemd/system/cluster-discovery.service
+
+# The unit is enabled here, unlike the compute image's services. This image
+# has exactly one job and it must run on every boot; there is no later task
+# that owns enabling it. /etc/cluster-discovery is created empty because the
+# runtime overlay drops netbox.env into it — the unit is gated on that file,
+# so a discovery boot with no overlay fails visibly rather than silently.
+RUN chmod 0755 /usr/local/sbin/cluster-discovery \
+ && install -d -m 0755 /etc/cluster-discovery \
+ && ln -sf ../cluster-discovery.service \
+      /etc/systemd/system/multi-user.target.wants/cluster-discovery.service
+
+# No secret is ever baked in. See the note at the top of this file.

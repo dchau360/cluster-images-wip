@@ -1,0 +1,24 @@
+[Unit]
+Description=Cluster node discovery and NetBox self-registration
+Documentation=https://github.com/dchau360/cluster-images-wip
+# Needs a network and the runtime overlay that carries the NetBox endpoint.
+# wwclient applies that overlay right after boot, so ordering after it is
+# what makes the environment file present when this runs.
+Wants=network-online.target
+After=network-online.target wwclient.service
+ConditionPathExists=/etc/cluster-discovery/netbox.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/cluster-discovery/netbox.env
+ExecStart=/usr/local/sbin/cluster-discovery
+# Both journal and console: the console is what a human watching the boot
+# sees, and what the lab harness captures in the per-node serial log. The
+# boot transcript is part of the evidence, not an afterthought.
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

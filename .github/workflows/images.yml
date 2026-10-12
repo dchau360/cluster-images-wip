@@ -92,7 +92,8 @@ jobs:
       - name: No identity material in any image layer
         run: |
           set -euo pipefail
-          for image in compute-base compute-slurm; do
+          mapfile -t images < <(bash -c 'source scripts/lib/common.sh >/dev/null 2>&1; lab_image_names')
+          for image in "${images[@]}"; do
             bash scripts/check-no-identity-in-image.sh \
               "${REGISTRY}/${GITHUB_REPOSITORY}/${image}:${{ steps.meta.outputs.tag }}"
           done
@@ -126,7 +127,8 @@ jobs:
             echo
             echo "| image | tag | digest |"
             echo "| --- | --- | --- |"
-            for image in compute-base compute-slurm; do
+            mapfile -t images < <(bash -c 'source scripts/lib/common.sh >/dev/null 2>&1; lab_image_names')
+            for image in "${images[@]}"; do
               ref="${REGISTRY}/${GITHUB_REPOSITORY}/${image}:${{ steps.meta.outputs.tag }}"
               digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" 2>/dev/null || echo unknown)"
               echo "| \`${image}\` | \`${{ steps.meta.outputs.tag }}\` | \`${digest}\` |"

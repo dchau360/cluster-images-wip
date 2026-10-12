@@ -8,11 +8,16 @@
         v
   compute-base        kernel, init, network, management. shared by every node.
         |
-        v
-  compute-slurm       the Slurm client, and nothing else.
+        +--> compute-slurm    the Slurm client, and nothing else.
+        |
+        +--> discovery        pynetbox + the self-registration payload.
 ```
 
-Two reasons for a layer rather than a second full image.
+The two node images are layers on `compute-base` for the same two reasons.
+`compute-slurm` layers the Slurm client; `discovery` layers `pynetbox` and
+the `cluster-discovery` payload. Neither rebuilds the kernel, dracut or the
+`wwinit` initramfs, so a change to either does not move the `image-build`
+phase for the base.
 
 **Honest measurement.** `image-build` is a phase in the project's 1-to-N
 curve. If a Slurm change rebuilt the whole node image, the phase would

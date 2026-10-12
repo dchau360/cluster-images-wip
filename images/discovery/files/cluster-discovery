@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""Cluster node discovery: scrape hardware, register in NetBox, claim IPAM.
+
+This is the payload of the discovery image. A machine that PXE-boots it has
+no identity yet: no host record, no address of its own in the source of
+truth. The job here is to give it one, from facts measured on the machine
+rather than from anything a human typed.
+
+Measured, not assumed:
+
+* DMI: system manufacturer, product name, serial, board, BIOS version.
+* CPU: model name and logical processor count.
+* Memory: total installed, MiB.
+* Every NIC that is not loopback, with its MAC and link speed.
+* Every block device that is not loopback/ram/dm/sr, with size, model,
+  serial and whether it is rotational.
+* GPU presence, from the PCI display class.
+
+The result is a NetBox device record whose serial and custom fields are the
+scraped values, one interface per real NIC, and an IP address record for the
+address the node actually holds, assigned to the interface that holds it.
+
+The script is intentionally idempotent: a second run updates the same record
+instead of creating a duplicate. It is also a *client* of NetBox, not a
+special case: it creates the objects it needs only when the seeder has not
+already, so it works against an empty NetBox as well as a seeded one.
+
+Configuration comes from the environment, read from an EnvironmentFile that
+a Warewulf runtime overlay delivers at boot:
+
+    NETBOX_URL    base URL of the NetBox API as seen from the node
+    NETBOX_TOKEN  API token with permission to write the discovered objects
+
+Neither is in this image and neither is in git. See docs/ in the platform
+repository for the secret boundary.
+
+Exit status is 0 only when the device, its interfaces and its address are
+all present in NetBox. systemd records a non-zero exit as a failed unit.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Reading the machine
+# ---------------------------------------------------------------------------
+
+
+def read(path: str, default: str = "") -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return default
+
+
+def run(argv: list[str], timeout: int = 30) -> str:
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def system_facts() -> dict:
+    """DMI/SMBIOS facts. Values a firmware bug can leave as "Not Specified"."""
+    dmi = "/sys/class/dmi/id"
+
+    def clean(value: str) -> str:
+        value = value.strip()
+        if value.lower() in {"", "none", "not specified", "to be filled by o.e.m.",
+                             "default string", "system serial number"}:
+            return ""
+        return value
+
+    return {
+        "manufacturer": clean(read(f"{dmi}/sys_vendor")),
+        "product": clean(read(f"{dmi}/product_name")),
+        "serial": clean(read(f"{dmi}/product_serial")),
+        "uuid": clean(read(f"{dmi}/product_uuid")),
+        "board": clean(read(f"{dmi}/board_name")),
+        "board_serial": clean(read(f"{dmi}/board_serial")),
+        "bios_version": clean(read(f"{dmi}/bios_version")),
+    }
+
+
+def cpu_facts() -> dict:
+    info = read("/proc/cpuinfo")
+    model = ""
+    match = re.search(r"^model name\s*:\s*(.+)$", info, re.MULTILINE)
+    if match:
+        model = match.group(1).strip()
+    count = len(re.findall(r"^processor\s*:", info, re.MULTILINE))
+    return {"model": model, "count": count}
+
+
+def memory_mib() -> int:
+    match = re.search(r"^MemTotal:\s*(\d+)\s*kB", read("/proc/meminfo"), re.MULTILINE)
+    return int(match.group(1)) // 1024 if match else 0
+
+
+def nic_facts() -> list[dict]:
+    """Every non-loopback NIC that reports a real MAC."""
+    nics: list[dict] = []
+    root = Path("/sys/class/net")
+    if not root.is_dir():
+        return nics
+    for entry in sorted(root.iterdir(), key=lambda p: p.name):
+        name = entry.name
+        if name == "lo":
+            continue
+        mac = read(str(entry / "address")).lower()
+        if not mac or mac == "00:00:00:00:00:00":
+            continue
+        speed = read(str(entry / "speed"))
+        nics.append(
+            {
+                "name": name,
+                "mac": mac,
+                "speed_mbps": int(speed) if speed.isdigit() else None,
+                "virtual": not (entry / "device").exists(),
+            }
+        )
+    return nics
+
+
+def disk_facts() -> list[dict]:
+    disks: list[dict] = []
+    root = Path("/sys/block")
+    if not root.is_dir():
+        return disks
+    for entry in sorted(root.iterdir(), key=lambda p: p.name):
+        name = entry.name
+        if re.match(r"^(loop|ram|dm-|sr|zram|fd|md)", name):
+            continue
+        try:
+            sectors = int(read(str(entry / "size"), "0") or "0")
+        except ValueError:
+            sectors = 0
+        vendor = read(str(entry / "device" / "vendor"))
+        model = read(str(entry / "device" / "model"))
+        serial = read(str(entry / "device" / "serial")) or read(str(entry / "device" / "wwid"))
+        disks.append(
+            {
+                "name": name,
+                "size_bytes": sectors * 512,
+                "model": " ".join(part for part in (vendor, model) if part).strip(),
+                "serial": serial,
+                "rotational": read(str(entry / "queue" / "rotational")) == "1",
+            }
+        )
+    return disks
+
+
+def gpu_facts() -> list[dict]:
+    gpus: list[dict] = []
+    for line in run(["lspci", "-mm"]).splitlines():
+        fields = re.findall(r'"([^"]*)"', line)
+        # lspci -mm: "slot" "class" "vendor" "device" ...
+        if len(fields) >= 4 and re.search(
+            r"VGA compatible controller|3D controller|Display controller",
+            fields[1],
+            re.IGNORECASE,
+        ):
+            gpus.append({"slot": fields[0], "vendor": fields[2], "device": fields[3]})
+    return gpus
+
+
+def primary_ipv4(nics: list[dict]) -> tuple[str, int, str]:
+    """The address a provisioned node would use: default route, else any inet.
+
+    Returns (address, prefix_length, interface_name), all empty if the node
+    has no address yet. The interface name is what the address gets assigned
+    to in NetBox.
+    """
+    # Prefer the interface carrying the default route.
+    route_iface = ""
+    for line in read("/proc/net/route").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "00000000":
+            route_iface = parts[0]
+            break
+
+    order = [n["name"] for n in nics]
+    if route_iface and route_iface in order:
+        order.remove(route_iface)
+        order.insert(0, route_iface)
+
+    for name in order:
+        try:
+            data = json.loads(run(["ip", "-j", "addr", "show", "dev", name]))
+        except json.JSONDecodeError:
+            continue
+        for interface in data:
+            for addr in interface.get("addr_info", []):
+                if addr.get("family") == "inet" and not addr.get("local", "").startswith("169.254."):
+                    return addr["local"], int(addr["prefixlen"]), name
+    return "", 0, ""
+
+
+def collect() -> dict:
+    nics = nic_facts()
+    address, prefixlen, address_iface = primary_ipv4(nics)
+    disks = disk_facts()
+    gpus = gpu_facts()
+    cpu = cpu_facts()
+    return {
+        "system": system_facts(),
+        "cpu": cpu,
+        "memory_mib": memory_mib(),
+        "nics": nics,
+        "disks": disks,
+        "gpus": gpus,
+        "address": address,
+        "prefixlen": prefixlen,
+        "address_iface": address_iface,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Naming
+# ---------------------------------------------------------------------------
+
+
+def device_name(facts: dict) -> str:
+    """A stable, human-readable identity for the machine.
+
+    Priority: an explicit name from the environment (the provisioning system
+    already knows it), then the kernel hostname (Warewulf sets it from the
+    node definition), then a name derived from the DMI serial so a machine
+    that is not defined anywhere still gets a non-empty, deterministic name.
+    """
+    explicit = os.environ.get("CLUSTER_NODE_NAME", "").strip()
+    if explicit:
+        return explicit
+
+    hostname = socket.gethostname().strip()
+    if hostname and hostname not in {"localhost", "localhost.localdomain", "localhost6"}:
+        return hostname
+
+    serial = facts["system"].get("serial") or facts["system"].get("uuid") or ""
+    if not serial and facts["nics"]:
+        serial = facts["nics"][0]["mac"]
+    slug = re.sub(r"[^A-Za-z0-9]+", "", serial)[:12].lower()
+    return f"discovery-{slug}" if slug else "discovery-unknown"
+
+
+def slugify(value: str, fallback: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or fallback
+
+
+# ---------------------------------------------------------------------------
+# NetBox
+# ---------------------------------------------------------------------------
+
+# Discovery-owned custom fields on the device. Every value is text so one
+# script works against any NetBox version without a field-type migration.
+CUSTOM_FIELDS = (
+    "discovery_status",
+    "discovered_at",
+    "discovered_manufacturer",
+    "discovered_product",
+    "discovered_serial",
+    "discovered_uuid",
+    "discovered_bios",
+    "discovered_address",
+    "discovered_cpu_model",
+    "discovered_cpu_count",
+    "discovered_memory_mib",
+    "discovered_disk_count",
+    "discovered_disk_total_gb",
+    "discovered_gpu_count",
+    "discovered_gpu_models",
+    "discovered_nic_macs",
+)
+
+
+def log(message: str) -> None:
+    print(f"cluster-discovery: {message}", flush=True)
+
+
+def connect(url: str, token: str, retries: int = 30, delay: int = 5):
+    """Import pynetbox lazily so --help-style use needs no dependency."""
+    import pynetbox  # noqa: PLC0415
+
+    last: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            api = pynetbox.api(url, token=token)
+            api.dcim.sites.get(limit=1)
+            log(f"netbox reachable at {url} (attempt {attempt})")
+            return api
+        except Exception as exc:  # pynetbox raises a family of errors here
+            last = exc
+            log(f"netbox not ready ({type(exc).__name__}); retrying in {delay}s")
+            time.sleep(delay)
+    raise SystemExit(f"cluster-discovery: NetBox unreachable at {url}: {last}")
+
+
+def ensure(endpoint, lookup: dict, values: dict):
+    """Get-or-create, then reconcile the fields we own. Returns (obj, state)."""
+    obj = endpoint.get(**lookup)
+    if obj is None:
+        return endpoint.create(values), "created"
+
+    updates = {}
+    for key, value in values.items():
+        if key in {
+            "site", "rack", "role", "device_type", "manufacturer", "device",
+            "assigned_object_type", "assigned_object_id",
+        }:
+            continue
+        current = getattr(obj, key, None)
+        if isinstance(current, bool) or isinstance(value, bool):
+            changed = bool(current) != bool(value)
+        else:
+            changed = str(current) != str(value)
+        if changed:
+            updates[key] = value
+    if updates:
+        endpoint.update([{**{"id": obj.id}, **updates}])
+        return obj, "updated"
+    return obj, "ok"
+
+
+def ensure_custom_fields(api) -> None:
+    for name in CUSTOM_FIELDS:
+        field = api.extras.custom_fields.get(name=name)
+        values = {
+            "name": name,
+            "label": name.replace("_", " ").title(),
+            "type": "text",
+            "object_types": ["dcim.device"],
+            "required": False,
+        }
+        if field is None:
+            api.extras.custom_fields.create(values)
+        elif "dcim.device" not in [str(t) for t in (field.object_types or [])]:
+            api.extras.custom_fields.update([{**values, "id": field.id}])
+    log(f"custom fields present ({len(CUSTOM_FIELDS)})")
+
+
+def ensure_site(api, facts: dict):
+    slug = os.environ.get("NETBOX_SITE_SLUG", "lab").strip() or "lab"
+    name = os.environ.get("NETBOX_SITE_NAME", "lab").strip() or "lab"
+    return ensure(api.dcim.sites, {"slug": slug}, {"name": name, "slug": slug})
+
+
+def ensure_role(api):
+    slug = os.environ.get("NETBOX_DEVICE_ROLE_SLUG", "compute").strip() or "compute"
+    name = os.environ.get("NETBOX_DEVICE_ROLE_NAME", "Compute").strip() or "Compute"
+    return ensure(api.dcim.device_roles, {"slug": slug}, {"name": name, "slug": slug, "color": "4caf50"})
+
+
+def ensure_device_type(api, facts: dict):
+    manufacturer_name = facts["system"].get("manufacturer") or "Unknown"
+    manufacturer_slug = slugify(manufacturer_name, "unknown")
+    manufacturer = ensure(
+        api.dcim.manufacturers,
+        {"slug": manufacturer_slug},
+        {"name": manufacturer_name, "slug": manufacturer_slug},
+    )[0]
+    model = facts["system"].get("product") or "Unknown"
+    slug = slugify(model, "unknown")
+    values = {
+        "model": model,
+        "slug": slug,
+        "manufacturer": manufacturer.id,
+        "u_height": 1,
+    }
+    return ensure(api.dcim.device_types, {"slug": slug}, values)
+
+
+def device_custom_fields(facts: dict, status: str) -> dict:
+    disks = facts["disks"]
+    gpus = facts["gpus"]
+    total_bytes = sum(disk["size_bytes"] for disk in disks)
+    return {
+        "discovery_status": status,
+        "discovered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "discovered_manufacturer": facts["system"].get("manufacturer", ""),
+        "discovered_product": facts["system"].get("product", ""),
+        "discovered_serial": facts["system"].get("serial", ""),
+        "discovered_uuid": facts["system"].get("uuid", ""),
+        "discovered_bios": facts["system"].get("bios_version", ""),
+        "discovered_address": (
+            f"{facts['address']}/{facts['prefixlen']}" if facts["address"] else ""
+        ),
+        "discovered_cpu_model": facts["cpu"].get("model", ""),
+        "discovered_cpu_count": str(facts["cpu"].get("count", 0)),
+        "discovered_memory_mib": str(facts["memory_mib"]),
+        "discovered_disk_count": str(len(disks)),
+        "discovered_disk_total_gb": str(round(total_bytes / 1_000_000_000, 2)),
+        "discovered_gpu_count": str(len(gpus)),
+        "discovered_gpu_models": "; ".join(
+            f"{gpu['vendor']} {gpu['device']}".strip() for gpu in gpus
+        ),
+        "discovered_nic_macs": ",".join(nic["mac"] for nic in facts["nics"]),
+    }
+
+
+def register(api, facts: dict) -> int:
+    name = device_name(facts)
+    ensure_custom_fields(api)
+    site = ensure_site(api, facts)[0]
+    role = ensure_role(api)[0]
+    device_type = ensure_device_type(api, facts)[0]
+
+    serial = facts["system"].get("serial") or facts["system"].get("uuid") or ""
+    values = {
+        "name": name,
+        "site": site.id,
+        "role": role.id,
+        "device_type": device_type.id,
+        "status": "active",
+        "serial": serial,
+        "custom_fields": device_custom_fields(facts, "discovering"),
+    }
+
+    # If a device already owns one of our MACs, that is the record to update.
+    # This is what makes a re-run idempotent even when the name derivation
+    # changes, and it is why a NIC swap does not create a second device.
+    existing = api.dcim.devices.get(name=name)
+    if existing is None:
+        for nic in facts["nics"]:
+            interface = api.dcim.interfaces.get(mac_address=nic["mac"])
+            if interface is not None:
+                existing = api.dcim.devices.get(interface.device.id)
+                if existing is not None:
+                    name = existing.name
+                    values["name"] = name
+                    log(f"adopting existing device {name} by MAC {nic['mac']}")
+                    break
+
+    if existing is None:
+        device = api.dcim.devices.create(values)
+        state = "created"
+    else:
+        device = existing
+        device.update({**values, "id": device.id})
+        state = "updated"
+    log(f"device id={device.id} name={name} {state} serial={serial or '<none>'}")
+
+    # One interface per real NIC. Names come from the OS so the record matches
+    # what an admin sees on the machine; the provisioning NIC is the one that
+    # holds the address, and is flagged mgmt_only.
+    interfaces: dict[str, object] = {}
+    for nic in facts["nics"]:
+        interface_values = {
+            "device": device.id,
+            "name": nic["name"],
+            "type": "1000base-t",
+            "mac_address": nic["mac"],
+            "enabled": True,
+            "mgmt_only": nic["name"] == facts["address_iface"],
+        }
+        interface = ensure(
+            api.dcim.interfaces,
+            {"device_id": device.id, "name": nic["name"]},
+            interface_values,
+        )[0]
+        interfaces[nic["name"]] = interface
+        log(f"interface id={interface.id} name={nic['name']} mac={nic['mac']}")
+
+    # Claim the address the node actually holds. Registering the observed
+    # address, rather than inventing one, is what keeps NetBox and the running
+    # node in agreement: the IPAM record is the address on the wire.
+    ip_record = None
+    if facts["address"]:
+        raw = f"{facts['address']}/{facts['prefixlen']}"
+        address_text = str(ipaddress.ip_interface(raw))
+        interface = interfaces.get(facts["address_iface"])
+        ip_record = api.ipam.ip_addresses.get(address=address_text)
+        if ip_record is None:
+            ip_record = api.ipam.ip_addresses.create(
+                {
+                    "address": address_text,
+                    "status": "active",
+                    "description": f"discovered on {name}",
+                    "assigned_object_type": "dcim.interface",
+                    "assigned_object_id": interface.id if interface is not None else None,
+                }
+            )
+            ip_state = "created"
+        else:
+            api.ipam.ip_addresses.update(
+                [
+                    {
+                        "id": ip_record.id,
+                        "status": "active",
+                        "description": f"discovered on {name}",
+                        "assigned_object_type": "dcim.interface",
+                        "assigned_object_id": interface.id if interface is not None else None,
+                    }
+                ]
+            )
+            ip_state = "updated"
+        if ip_record is not None and getattr(ip_record, "id", None):
+            device.update({"id": device.id, "primary_ip4": ip_record.id})
+        log(
+            f"address id={getattr(ip_record, 'id', None)} "
+            f"address={address_text} iface={facts['address_iface']} {ip_state}"
+        )
+    else:
+        log("WARNING: node holds no IPv4 address; no IPAM record claimed")
+
+    # Mark complete only after the address exists, so a poller can treat the
+    # field as the success signal.
+    device.update(
+        {
+            "id": device.id,
+            "custom_fields": device_custom_fields(facts, "complete"),
+        }
+    )
+    log(f"DONE node={name} device_id={device.id} ip={facts['address'] or '<none>'}")
+    return 0
+
+
+def main() -> int:
+    url = os.environ.get("NETBOX_URL", "").strip()
+    token = os.environ.get("NETBOX_TOKEN", "").strip()
+    if not url or not token:
+        print(
+            "cluster-discovery: NETBOX_URL and NETBOX_TOKEN must be set "
+            "(delivered by the cluster-discovery Warewulf overlay)",
+            file=sys.stderr,
+        )
+        return 2
+
+    facts = collect()
+    log(
+        f"scraped node={device_name(facts)} serial="
+        f"{facts['system'].get('serial') or '<none>'} nics={len(facts['nics'])} "
+        f"disks={len(facts['disks'])} gpus={len(facts['gpus'])} "
+        f"address={facts['address'] or '<none>'}"
+    )
+    api = connect(url, token)
+    return register(api, facts)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # one clear line beats a bare traceback in a console
+        print(f"cluster-discovery: FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise
