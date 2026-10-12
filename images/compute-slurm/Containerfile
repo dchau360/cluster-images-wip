@@ -14,7 +14,57 @@
 ARG IMAGE_BASE=docker.io/rockylinux/rockylinux:9
 ARG BASE_IMAGE=cluster-lab/compute-base:latest
 
+# ---------------------------------------------------------------------------
+# Slurm, built from the pinned upstream release.
+#
+# Configless Slurm means `slurmd` fetches its configuration from `slurmctld`
+# over Slurm's own RPC, so the two must speak the same protocol. Slurm keeps
+# compatibility with the previous three major releases only. EPEL 9 ships
+# 22.05; the head node's controller is 25.11, which refuses it. Building the
+# same release the controller runs, from the SchedMD tarball with a pinned
+# checksum, makes the version a reviewable line in this file rather than
+# whatever a distribution happened to carry.
+#
+# A separate stage, so compilers and -devel packages never reach the image a
+# node boots.
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS slurm-build
+
+ARG SLURM_VERSION=25.11.2
+ARG SLURM_SHA256=9bfd844f746c1268d6e0cb14bda586b548b1c4b12f8c72181397d0cec9ce5d39
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+# `mariadb-devel` is unconditional in the upstream spec even when slurmdbd is
+# never installed; it comes from CRB, which compute-base enables.
+RUN dnf -y install --setopt=install_weak_deps=False \
+      rpm-build gcc make autoconf automake pkgconf-pkg-config \
+      perl perl-devel 'perl(ExtUtils::MakeMaker)' python3 \
+      readline-devel pam-devel munge-devel dbus-devel kernel-headers \
+      hwloc-devel numactl-devel mariadb-devel \
+ && dnf -y clean all \
+ && rm -rf /var/cache/dnf
+
+# `--with cgroupv2`: Rocky 9 boots the unified hierarchy, and a slurmd that
+# can only drive cgroup v1 constrains nothing. `--with hwloc --with numa` so
+# slurmd reports the topology it actually has.
+RUN curl -fsSLo "/tmp/slurm-${SLURM_VERSION}.tar.bz2" \
+      "https://download.schedmd.com/slurm/slurm-${SLURM_VERSION}.tar.bz2" \
+ && echo "${SLURM_SHA256}  /tmp/slurm-${SLURM_VERSION}.tar.bz2" | sha256sum -c - \
+ && rpmbuild -ta --with cgroupv2 --with hwloc --with numa \
+      --define '_build_id_links none' \
+      "/tmp/slurm-${SLURM_VERSION}.tar.bz2" \
+ && mkdir -p /out \
+ && cp /root/rpmbuild/RPMS/x86_64/slurm-"${SLURM_VERSION}"-*.rpm \
+       /root/rpmbuild/RPMS/x86_64/slurm-slurmd-"${SLURM_VERSION}"-*.rpm \
+       /out/
+
+# ---------------------------------------------------------------------------
+# The image a compute node boots.
+# ---------------------------------------------------------------------------
 FROM ${BASE_IMAGE}
+
+ARG SLURM_VERSION=25.11.2
 
 LABEL org.opencontainers.image.title="cluster-lab compute-slurm"
 LABEL org.opencontainers.image.description="Compute node image with the Slurm client"
@@ -23,10 +73,16 @@ LABEL org.opencontainers.image.source="https://github.com/dchau360/cluster-image
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 COPY packages.txt /tmp/packages.txt
+COPY --from=slurm-build /out/ /tmp/slurm-rpms/
+# EPEL's 22.05 `slurm` is excluded so a later `dnf update` inside the image
+# can never replace the pinned build with one the controller refuses.
 RUN mapfile -t pkgs < <(grep -vE '^[[:space:]]*(#|$)' /tmp/packages.txt) \
- && dnf -y install --setopt=install_weak_deps=False "${pkgs[@]}" \
+ && dnf -y install --setopt=install_weak_deps=False "${pkgs[@]}" /tmp/slurm-rpms/*.rpm \
+ && echo 'excludepkgs=slurm*' >> /etc/dnf/dnf.conf \
+ && test "$(rpm -q --qf '%{VERSION}' slurm-slurmd)" = "${SLURM_VERSION}" \
+ && /usr/sbin/slurmd -V \
  && dnf -y clean all \
- && rm -rf /var/cache/dnf /var/log/dnf* /var/log/yum* /tmp/packages.txt
+ && rm -rf /var/cache/dnf /var/log/dnf* /var/log/yum* /tmp/packages.txt /tmp/slurm-rpms
 
 # Services ship DISABLED. `slurmd` and `munge` have no enablement symlink
 # here on purpose: the node self-configuration task enables them, and it

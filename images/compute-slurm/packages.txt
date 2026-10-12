@@ -1,5 +1,13 @@
-# The Slurm client layer. `slurmd` is the daemon a compute node runs;
-# `munge` is the authentication library every Slurm component needs.
-slurm
-slurm-slurmd
+# Runtime packages for the Slurm compute layer, one per line.
+#
+# Slurm itself is NOT here. EPEL 9 ships 22.05, and the controller on the head
+# node runs a release that no longer speaks to it, so the Containerfile builds
+# the pinned upstream release instead. `munge` is the authentication library
+# every Slurm component needs; the rest are what the built RPMs link against.
 munge
+munge-libs
+hwloc-libs
+numactl-libs
+dbus-libs
+readline
+pam
