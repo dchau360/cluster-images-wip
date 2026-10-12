@@ -86,6 +86,17 @@ jobs:
           EOF
           bash scripts/build.sh
 
+      # The build just made the images. Prove the identity boundary before
+      # they are reported as published: no Munge key, no SSH host key, in any
+      # layer or in the flattened filesystem.
+      - name: No identity material in any image layer
+        run: |
+          set -euo pipefail
+          for image in compute-base compute-slurm; do
+            bash scripts/check-no-identity-in-image.sh \
+              "${REGISTRY}/${GITHUB_REPOSITORY}/${image}:${{ steps.meta.outputs.tag }}"
+          done
+
       - name: Make the published packages public
         # Containers pushed with GITHUB_TOKEN can land private. Public is a
         # functional requirement here, not a preference, so say so loudly

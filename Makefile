@@ -19,7 +19,8 @@ IMAGE ?=
 export IMAGE
 
 .PHONY: help build import images timings lint lint-yaml lint-shell \
-        lint-containerfiles secrets tracked-secrets check-host-values clean
+        lint-containerfiles secrets tracked-secrets check-host-values \
+        check-image-identity clean
 
 help: ## Show this help
 	@printf 'cluster-images-wip\n\n'
@@ -61,6 +62,12 @@ secrets: ## Run gitleaks over the worktree and the full history
 
 tracked-secrets: ## Fail if a tracked file is named or placed like key material
 	@$(RUN) $(S)/check-no-tracked-secrets.sh
+
+# Needs a built or pulled image and a container engine; not part of `lint`,
+# which must run without either. The images workflow runs it on every build.
+check-image-identity: ## Fail if identity material is in any image layer. IMAGE_REF=<ref>
+	@test -n "$${IMAGE_REF:-}" || { echo 'set IMAGE_REF=<image-ref> [<image-ref>...]' >&2; exit 2; }
+	@$(RUN) $(S)/check-no-identity-in-image.sh $${IMAGE_REF}
 
 lint-yaml: ## yamllint
 	$(call need,yamllint,See docs/lab-host-setup.md in the platform repo.)
