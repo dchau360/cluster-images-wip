@@ -19,7 +19,7 @@ IMAGE ?=
 export IMAGE
 
 .PHONY: help build import images timings lint lint-yaml lint-shell \
-        lint-containerfiles secrets tracked-secrets check-host-values \
+        lint-containerfiles secrets tracked-secrets git-identity check-host-values \
         check-image-identity clean
 
 help: ## Show this help
@@ -50,7 +50,7 @@ need = @command -v $(1) >/dev/null 2>&1 || { \
 	  printf 'error: %s not found, so this gate cannot run.\n       %s\n' '$(1)' '$(2)' >&2; \
 	  exit 127; }
 
-lint: check-host-values secrets tracked-secrets lint-yaml lint-shell lint-containerfiles ## Run every repo gate
+lint: check-host-values secrets tracked-secrets git-identity lint-yaml lint-shell lint-containerfiles ## Run every repo gate
 
 check-host-values: ## Fail if any host-specific value is in a tracked file
 	@$(RUN) $(S)/check-no-host-values.sh
@@ -62,6 +62,9 @@ secrets: ## Run gitleaks over the worktree and the full history
 
 tracked-secrets: ## Fail if a tracked file is named or placed like key material
 	@$(RUN) $(S)/check-no-tracked-secrets.sh
+
+git-identity: ## Fail if key material ever existed in git history, not just the tip
+	@$(RUN) $(S)/check-no-identity-in-git.sh
 
 # Needs a built or pulled image and a container engine; not part of `lint`,
 # which must run without either. The images workflow runs it on every build.
