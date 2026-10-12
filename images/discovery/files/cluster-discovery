@@ -141,6 +141,70 @@ def nic_facts() -> list[dict]:
     return nics
 
 
+def infiniband_facts(root: str = "/sys/class/infiniband") -> list[dict]:
+    """Every InfiniBand port under sysfs, with its GUIDs.
+
+    This lab has no InfiniBand hardware, so on the lab this returns an empty
+    list and nothing below it changes. It is written for a machine that has
+    an HCA, and exercised against a synthetic sysfs tree in the tests. A GID
+    of all zeroes means an uninitialised port: it is reported without a port
+    GUID rather than with a value every such port would share.
+
+    The same conversion lives in the platform repository as
+    netbox/ib_guid.py, where the DHCP side uses it. Kept self-contained here
+    for the same reason every other reader in this file is: the discovery
+    image carries no dependency on another repository.
+    """
+    ports: list[dict] = []
+    base = Path(root)
+    if not base.is_dir():
+        return ports
+
+    def hex_only(value: str) -> str:
+        return re.sub(r"[^0-9a-f]", "", value.strip().lower())
+
+    def guid_from(text: str) -> str:
+        text = hex_only(text)
+        if len(text) != 16:
+            return ""
+        guid = ":".join(text[i:i + 4] for i in range(0, 16, 4))
+        return "" if set(text) <= {"0"} else guid
+
+    for device in sorted(base.iterdir(), key=lambda p: p.name):
+        if not device.is_dir():
+            continue
+        node_guid = guid_from(read(str(device / "node_guid")))
+        ports_dir = device / "ports"
+        if not ports_dir.is_dir():
+            continue
+        for port in sorted(ports_dir.iterdir(), key=lambda p: p.name):
+            if not port.is_dir():
+                continue
+            gid0 = hex_only(read(str(port / "gids" / "0")))
+            # GID 0 carries the port GUID in its low 64 bits on an IB link.
+            port_guid = guid_from(gid0[16:]) if len(gid0) == 32 else ""
+            netdev = ""
+            ndevs = port / "gid_attrs" / "ndevs"
+            if ndevs.is_dir():
+                for entry in sorted(ndevs.iterdir(), key=lambda p: p.name):
+                    name = read(str(entry))
+                    if name:
+                        netdev = name
+                        break
+            ports.append(
+                {
+                    "device": device.name,
+                    "port": port.name,
+                    "node_guid": node_guid,
+                    "port_guid": port_guid,
+                    "netdev": netdev,
+                    "state": read(str(port / "state")).strip(),
+                    "rate": read(str(port / "rate")).strip(),
+                }
+            )
+    return ports
+
+
 def disk_facts() -> list[dict]:
     disks: list[dict] = []
     root = Path("/sys/block")
@@ -228,6 +292,7 @@ def collect() -> dict:
         "nics": nics,
         "disks": disks,
         "gpus": gpus,
+        "infiniband": infiniband_facts(),
         "address": address,
         "prefixlen": prefixlen,
         "address_iface": address_iface,
@@ -290,7 +355,13 @@ CUSTOM_FIELDS = (
     "discovered_gpu_count",
     "discovered_gpu_models",
     "discovered_nic_macs",
+    "discovered_ib_ports",
 )
+
+# Interface-scoped, and one of the two deliberate honesty notes in this
+# repository: the lab has no InfiniBand hardware, so a GUID only ever
+# reaches this field from a synthetic fixture in the tests.
+INTERFACE_CUSTOM_FIELDS = ("ib_guid",)
 
 
 def log(message: str) -> None:
@@ -355,7 +426,21 @@ def ensure_custom_fields(api) -> None:
             api.extras.custom_fields.create(values)
         elif "dcim.device" not in [str(t) for t in (field.object_types or [])]:
             api.extras.custom_fields.update([{**values, "id": field.id}])
-    log(f"custom fields present ({len(CUSTOM_FIELDS)})")
+    for name in INTERFACE_CUSTOM_FIELDS:
+        field = api.extras.custom_fields.get(name=name)
+        values = {
+            "name": name,
+            "label": name.replace("_", " ").title(),
+            "type": "text",
+            "object_types": ["dcim.interface"],
+            "required": False,
+        }
+        if field is None:
+            api.extras.custom_fields.create(values)
+        elif "dcim.interface" not in [str(t) for t in (field.object_types or [])]:
+            api.extras.custom_fields.update([{**values, "id": field.id}])
+    log(f"custom fields present ({len(CUSTOM_FIELDS)} device, "
+        f"{len(INTERFACE_CUSTOM_FIELDS)} interface)")
 
 
 def ensure_site(api, facts: dict):
@@ -414,6 +499,11 @@ def device_custom_fields(facts: dict, status: str) -> dict:
             f"{gpu['vendor']} {gpu['device']}".strip() for gpu in gpus
         ),
         "discovered_nic_macs": ",".join(nic["mac"] for nic in facts["nics"]),
+        "discovered_ib_ports": "; ".join(
+            f"{port['device']}/{port['port']}="
+            f"{port['port_guid'] or 'no-guid'}"
+            for port in facts.get("infiniband", [])
+        ),
     }
 
 
@@ -479,6 +569,34 @@ def register(api, facts: dict) -> int:
         )[0]
         interfaces[nic["name"]] = interface
         log(f"interface id={interface.id} name={nic['name']} mac={nic['mac']}")
+
+    # InfiniBand ports, when the machine has any. On this lab the list is
+    # empty, so this adds nothing and changes nothing. A port that maps to a
+    # netdev is the same interface the loop above may have created, and
+    # `ensure` reconciles it so the GUID lands on one record, not a second
+    # one. The NetBox type is `other` rather than a specific IB choice,
+    # because this path cannot be exercised on hardware here and a wrong
+    # choice would fail the whole registration; the GUID is the fact that
+    # matters and it is carried in its own field.
+    for port in facts.get("infiniband", []):
+        if not port["port_guid"]:
+            continue
+        iface_name = port["netdev"] or f"{port['device']}-{port['port']}"
+        interface = ensure(
+            api.dcim.interfaces,
+            {"device_id": device.id, "name": iface_name},
+            {
+                "device": device.id,
+                "name": iface_name,
+                "type": "other",
+                "enabled": True,
+                "mgmt_only": False,
+                "custom_fields": {"ib_guid": port["port_guid"]},
+            },
+        )[0]
+        interfaces[iface_name] = interface
+        log(f"interface id={interface.id} name={iface_name} "
+            f"ib_guid={port['port_guid']}")
 
     # Claim the address the node actually holds. Registering the observed
     # address, rather than inventing one, is what keeps NetBox and the running

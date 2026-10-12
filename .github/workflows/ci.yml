@@ -154,3 +154,15 @@ jobs:
         run: |
           set -euo pipefail
           git ls-files '*.sh' | while read -r f; do bash -n "$f"; echo "ok $f"; done
+
+  python-tests:
+    name: python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      # The InfiniBand GUID reader is exercised against a synthetic sysfs
+      # tree, because this lab has no IB hardware. No dependencies.
+      - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
