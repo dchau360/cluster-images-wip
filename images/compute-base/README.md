@@ -16,6 +16,10 @@ make build IMAGE=compute-base
   image.
 - Network and management basics: SSH server, time sync, rsync.
 - Anything shared by every node, so it is built once and served N times.
+- The RDMA userspace (`rdma-core`, `libibverbs-utils`, `perftest`). The
+  kernel module for Soft-RoCE (`rdma_rxe`) comes with the kernel; the
+  libraries and the benchmark did not, and a node cannot install them for
+  itself without a package mirror on the isolated segment.
 
 ## What does not
 

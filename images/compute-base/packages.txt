@@ -67,3 +67,18 @@ openmpi
 hwloc
 numactl
 openblas
+
+# RDMA userspace.
+#
+# The `rdma_rxe` kernel module is already in the Rocky kernel this image
+# installs; what the image lacked was the userspace to drive it. `rdma-core`
+# brings the provider libraries and the udev rules, `libibverbs-utils` gives
+# `ibv_devinfo` so a test can prove a verbs device exists before benchmarking
+# it, and `perftest` is the benchmark itself (`ib_write_bw`, `ib_send_bw`).
+#
+# This is Soft-RoCE: a software RDMA data path over an ordinary Ethernet NIC.
+# It is not InfiniBand hardware and there is no subnet manager. See
+# `cluster-platform-wip/docs/rdma-soft-roce.md`.
+rdma-core
+libibverbs-utils
+perftest
