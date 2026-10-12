@@ -94,6 +94,11 @@ RUN groupadd --system --gid "${SLURM_UID}" slurm \
  && useradd --system --uid "${SLURM_UID}" --gid slurm \
       --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin slurm
 
+# DRILL (SRE-7): a deliberately broken image. slurmd is removed, so a node
+# booted on it fails its pull run and never registers; the rolling update
+# must roll that node back. Published only under a drill tag; never merge.
+RUN rm -f /usr/sbin/slurmd /usr/lib/systemd/system/slurmd.service
+
 # Services ship DISABLED. `slurmd` and `munge` have no enablement symlink
 # here on purpose: the node self-configuration task enables them, and it
 # needs the cluster's Munge key first.
