@@ -84,6 +84,16 @@ RUN mapfile -t pkgs < <(grep -vE '^[[:space:]]*(#|$)' /tmp/packages.txt) \
  && dnf -y clean all \
  && rm -rf /var/cache/dnf /var/log/dnf* /var/log/yum* /tmp/packages.txt /tmp/slurm-rpms
 
+# The account slurm.conf names as SlurmUser. slurmd resolves it while parsing
+# the configless config it fetches and exits if it cannot, and the upstream
+# RPMs do not create it. 64030 is the UID the controller's Debian package
+# uses; the platform's slurm_compute role asserts the same value, so a node
+# can start slurmd before its first pull run rather than after it.
+ARG SLURM_UID=64030
+RUN groupadd --system --gid "${SLURM_UID}" slurm \
+ && useradd --system --uid "${SLURM_UID}" --gid slurm \
+      --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin slurm
+
 # Services ship DISABLED. `slurmd` and `munge` have no enablement symlink
 # here on purpose: the node self-configuration task enables them, and it
 # needs the cluster's Munge key first.
