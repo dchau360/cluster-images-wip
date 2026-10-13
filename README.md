@@ -243,4 +243,4 @@ the last.
 
 ## Licence
 
-Not yet chosen. Treat as all rights reserved until it is.
+MIT — see [LICENSE](LICENSE).
