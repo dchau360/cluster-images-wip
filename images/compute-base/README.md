@@ -3,12 +3,13 @@
 The common node image. Everything every compute node needs, and nothing it
 does not.
 
-Stub. The image task owns the content; the build harness around it works
-today:
-
 ```sh
 make build IMAGE=compute-base
 ```
+
+Every provisioned node in the lab boots a layer on top of this image, and the
+RDMA benchmark in the platform's `make rdma-test` runs against the userspace
+it ships.
 
 ## What belongs here
 
