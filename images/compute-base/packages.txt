@@ -28,6 +28,11 @@ chrony
 openssh-server
 openssh-clients
 
+# shared storage. The head node exports /home and /opt/software over NFS and
+# cluster-platform-wip's shared_storage role mounts them; without the client
+# the mount units exist and fail.
+nfs-utils
+
 # hardware inventory. dmidecode and pciutils are used by the discovery image;
 # the rest make the node self-describing after it boots.
 dmidecode
